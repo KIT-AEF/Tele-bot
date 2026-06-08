@@ -2,14 +2,16 @@ import os
 import json
 import logging
 import time
+import threading
 import requests
 import telebot
 from telebot import types
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ==========================================
 # الإعدادات
 # ==========================================
-TOKEN = "8841147509:AAGQJu6MoRQdkAD-wphy7Xkzn5xa7X6XMRg"
+TOKEN = "8841147509:AAGGm0ydQptJCyQ19fOqjl4V2O14bijKRU8"
 OWNER_ID = "7115401970"
 
 DATA_DIR = "./data"
@@ -524,14 +526,36 @@ def handle_biz(message):
 
 
 # ==========================================
+# Health Server (مطلوب عشان Render يشتغل)
+# ==========================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # متطبعش logs الـ HTTP
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+# ==========================================
 # تشغيل البوت
 # ==========================================
 
 if __name__ == "__main__":
+    # شغّل الـ health server في thread منفصل
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
     try:
         bot.remove_webhook()
     except Exception:
         pass
+
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=20,
