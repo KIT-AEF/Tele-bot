@@ -1,8 +1,10 @@
+
 import os
 import json
 import logging
 import time
 import threading
+import datetime
 import requests
 import telebot
 from telebot import types
@@ -11,14 +13,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ==========================================
 # الإعدادات
 # ==========================================
-TOKEN = "8841147509:AAGQJu6MoRQdkAD-wphy7Xkzn5xa7X6XMRg"
+TOKEN    = "8841147509:AAGQJu6MoRQdkAD-wphy7Xkzn5xa7X6XMRg"
 OWNER_ID = "7115401970"
 
-DATA_DIR = "./data"
-os.makedirs(DATA_DIR, exist_ok=True)
-DATA_FILE = os.path.join(DATA_DIR, "data.json")
+DATA_DIR   = "./data"
+CACHE_DIR  = os.path.join(DATA_DIR, "cache")
+DATA_FILE  = os.path.join(DATA_DIR, "data.json")
+CACHE_FILE = os.path.join(DATA_DIR, "msg_cache.json")
 
-# تشغيل البوت بدون threading لتقليل الموارد
+os.makedirs(DATA_DIR,  exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+MAX_CACHE_BYTES = 50 * 1024 * 1024   # 50 MB إجمالي لكل المستخدمين
+
 bot = telebot.TeleBot(TOKEN, threaded=False)
 
 logging.basicConfig(
@@ -28,36 +35,116 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# حالات المستخدم في الذاكرة
-user_states = {}
+user_states      = {}
 user_temp_trigger = {}
 
+# ==========================================
+# قفل للكتابة على الملفات
+# ==========================================
+_data_lock  = threading.Lock()
+_cache_lock = threading.Lock()
 
 # ==========================================
-# البيانات (JSON)
+# بيانات الإعدادات
 # ==========================================
 
 def load_data():
     default = {"connections": {}, "custom_commands": {}, "shortcuts": {}}
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
+    with _data_lock:
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    d = json.load(f)
                 for k in default:
-                    if k not in d:
-                        d[k] = default[k]
+                    d.setdefault(k, default[k])
                 return d
-        except Exception:
-            pass
+            except Exception:
+                pass
     return default
 
 def save_data(data):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"save_data: {e}")
+    with _data_lock:
+        try:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"save_data: {e}")
 
+# ==========================================
+# كاش الرسائل
+# msg_cache = { "owner_uid": { "chat_id_msgid": {...} } }
+# ==========================================
+
+def load_cache():
+    with _cache_lock:
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    return {}
+
+def save_cache(cache):
+    with _cache_lock:
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"save_cache: {e}")
+
+def cache_size_bytes(cache):
+    return len(json.dumps(cache, ensure_ascii=False).encode("utf-8"))
+
+def cache_msg(owner_uid, chat_id, msg_id, text="", caption="",
+              media_type=None, file_id=None, sender_name="", sender_id=None):
+    cache = load_cache()
+    user_cache = cache.setdefault(str(owner_uid), {})
+    key = f"{chat_id}_{msg_id}"
+    user_cache[key] = {
+        "chat_id":     chat_id,
+        "msg_id":      msg_id,
+        "text":        text,
+        "caption":     caption,
+        "media_type":  media_type,
+        "file_id":     file_id,
+        "sender_name": sender_name,
+        "sender_id":   sender_id,
+        "ts":          time.time(),
+        "date":        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    # تحقق من الحجم — لو تجاوز الـ 50MB احذف الأقدم
+    while cache_size_bytes(cache) > MAX_CACHE_BYTES:
+        # ابحث عن أقدم رسالة في كل المستخدمين وامسحها
+        oldest_uid = oldest_key = oldest_ts = None
+        for uid, msgs in cache.items():
+            for k, v in msgs.items():
+                if oldest_ts is None or v.get("ts", 0) < oldest_ts:
+                    oldest_ts  = v.get("ts", 0)
+                    oldest_uid = uid
+                    oldest_key = k
+        if oldest_uid and oldest_key:
+            del cache[oldest_uid][oldest_key]
+        else:
+            break
+    save_cache(cache)
+
+def get_cached_msg(owner_uid, chat_id, msg_id):
+    cache = load_cache()
+    return cache.get(str(owner_uid), {}).get(f"{chat_id}_{msg_id}")
+
+def delete_cached_msg(owner_uid, chat_id, msg_id):
+    cache = load_cache()
+    cache.get(str(owner_uid), {}).pop(f"{chat_id}_{msg_id}", None)
+    save_cache(cache)
+
+def update_cached_text(owner_uid, chat_id, msg_id, new_text="", new_caption=""):
+    cache = load_cache()
+    entry = cache.get(str(owner_uid), {}).get(f"{chat_id}_{msg_id}")
+    if entry:
+        entry["text"]    = new_text
+        entry["caption"] = new_caption
+        save_cache(cache)
 
 # ==========================================
 # دوال مساعدة
@@ -76,18 +163,23 @@ def safe_request(url, payload=None, timeout=10):
             r = requests.post(url, json=payload, timeout=timeout)
             return r.json()
         except Exception as e:
-            logger.warning(f"safe_request attempt failed: {e}")
+            logger.warning(f"safe_request: {e}")
     return {"ok": False, "description": "فشل الاتصال"}
 
 def get_user_commands(data, uid):
     cmds = dict(data.get("custom_commands", {}).get(uid, {}))
-    for k, v in {"delete": "!delete", "pin": "!pin", "unpin": "!unpin", "id": "!id", "help": "!help"}.items():
+    for k, v in {"delete": "!delete", "pin": "!pin", "unpin": "!unpin",
+                 "id": "!id", "help": "!help"}.items():
         cmds.setdefault(k, v)
     return cmds
 
 def get_conn_id(data, uid):
     return data["connections"].get(uid)
 
+def sender_display(msg):
+    u = msg.from_user
+    nm = ((u.first_name or "") + " " + (u.last_name or "")).strip() or "غير معروف"
+    return nm, str(u.id)
 
 # ==========================================
 # Telegram Business API
@@ -111,44 +203,73 @@ def api_edit(conn_id, chat_id, msg_id, text):
                          "message_id": msg_id, "text": text, "parse_mode": "HTML"})
 
 def api_check_connection(conn_id):
-    """يتحقق من الربط مباشرة عبر getBusinessConnection"""
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/getBusinessConnection",
-            json={"business_connection_id": conn_id},
-            timeout=8
-        )
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/getBusinessConnection",
+                          json={"business_connection_id": conn_id}, timeout=8)
         res = r.json()
-        if res.get("ok") and res.get("result", {}).get("is_enabled"):
-            return True
-        return False
+        return res.get("ok") and res.get("result", {}).get("is_enabled", False)
     except Exception:
         return False
 
+def bot_send(chat_id, text, markup=None):
+    try:
+        return bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logger.warning(f"bot_send: {e}")
+
+def bot_send_media(chat_id, entry, caption_extra=""):
+    """يرسل الوسائط المحفوظة للمستخدم"""
+    fid   = entry.get("file_id")
+    mtype = entry.get("media_type")
+    cap   = (entry.get("caption") or "") + caption_extra
+    cap   = cap[:1024] if cap else None
+    try:
+        if mtype == "photo":
+            bot.send_photo(chat_id, fid, caption=cap)
+        elif mtype == "video":
+            bot.send_video(chat_id, fid, caption=cap)
+        elif mtype == "document":
+            bot.send_document(chat_id, fid, caption=cap)
+        elif mtype == "voice":
+            bot.send_voice(chat_id, fid, caption=cap)
+        elif mtype == "audio":
+            bot.send_audio(chat_id, fid, caption=cap)
+        elif mtype == "sticker":
+            bot.send_sticker(chat_id, fid)
+        elif mtype == "animation":
+            bot.send_animation(chat_id, fid, caption=cap)
+        elif mtype == "video_note":
+            bot.send_video_note(chat_id, fid)
+        else:
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"bot_send_media: {e}")
+        return False
 
 # ==========================================
-# لوحة الأزرار — كل زرين جنب بعض
+# لوحة الأزرار
 # ==========================================
 
 def kb_main():
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(
-        types.InlineKeyboardButton("⚙️ تخصيص الأوامر", callback_data="menu_commands"),
-        types.InlineKeyboardButton("⚡ الاختصارات",     callback_data="menu_shortcuts"),
+        types.InlineKeyboardButton("⚙️ تخصيص الأوامر",  callback_data="menu_commands"),
+        types.InlineKeyboardButton("⚡ الاختصارات",      callback_data="menu_shortcuts"),
         types.InlineKeyboardButton("📋 الأوامر الحالية", callback_data="show_commands"),
-        types.InlineKeyboardButton("🔗 حالة الربط",     callback_data="check_connection"),
+        types.InlineKeyboardButton("🔗 حالة الربط",      callback_data="check_connection"),
     )
     return m
 
 def kb_commands():
     m = types.InlineKeyboardMarkup(row_width=2)
     m.add(
-        types.InlineKeyboardButton("✏️ أمر الحذف",          callback_data="set_cmd_delete"),
-        types.InlineKeyboardButton("✏️ أمر التثبيت",        callback_data="set_cmd_pin"),
-        types.InlineKeyboardButton("✏️ إلغاء التثبيت",      callback_data="set_cmd_unpin"),
-        types.InlineKeyboardButton("✏️ أمر الآيدي",         callback_data="set_cmd_id"),
-        types.InlineKeyboardButton("✏️ أمر المساعدة",       callback_data="set_cmd_help"),
-        types.InlineKeyboardButton("🔙 رجوع",               callback_data="menu_main"),
+        types.InlineKeyboardButton("✏️ أمر الحذف",      callback_data="set_cmd_delete"),
+        types.InlineKeyboardButton("✏️ أمر التثبيت",    callback_data="set_cmd_pin"),
+        types.InlineKeyboardButton("✏️ إلغاء التثبيت",  callback_data="set_cmd_unpin"),
+        types.InlineKeyboardButton("✏️ أمر الآيدي",     callback_data="set_cmd_id"),
+        types.InlineKeyboardButton("✏️ أمر المساعدة",   callback_data="set_cmd_help"),
+        types.InlineKeyboardButton("🔙 رجوع",           callback_data="menu_main"),
     )
     return m
 
@@ -165,19 +286,16 @@ def kb_shortcuts():
 def kb_shortcuts_list(shortcuts):
     m = types.InlineKeyboardMarkup(row_width=2)
     btns = [types.InlineKeyboardButton(f"🗑️ {t}", callback_data=f"delsh_{t}") for t in shortcuts]
-    # إضافة الأزرار اثنين اثنين
     for i in range(0, len(btns), 2):
-        row = btns[i:i+2]
-        m.add(*row)
+        m.add(*btns[i:i+2])
     m.add(
         types.InlineKeyboardButton("➕ إضافة", callback_data="add_shortcut"),
         types.InlineKeyboardButton("🔙 رجوع",  callback_data="menu_shortcuts"),
     )
     return m
 
-
 # ==========================================
-# /start مع تحقق تلقائي من الربط
+# /start
 # ==========================================
 
 @bot.message_handler(commands=["start"])
@@ -187,79 +305,56 @@ def handle_start(message):
         bot.send_message(message.chat.id, "⛔ غير مصرح.")
         return
 
-    data = load_data()
+    data    = load_data()
     conn_id = get_conn_id(data, uid)
-    name = escape_html(message.from_user.first_name or "")
+    name    = escape_html(message.from_user.first_name or "")
 
     if conn_id:
-        # تحقق فعلي من تيليجرام
         wait = bot.send_message(message.chat.id, "🔄 جاري التحقق من الربط...")
-        is_active = api_check_connection(conn_id)
+        ok   = api_check_connection(conn_id)
         try:
             bot.delete_message(message.chat.id, wait.message_id)
         except Exception:
             pass
-
-        if is_active:
-            bot.send_message(
-                message.chat.id,
-                f"مرحباً {name}! ✅\n\n🔗 <b>الحساب التجاري مرتبط وشغال.</b>\n\nاختر ما تريد:",
-                parse_mode="HTML", reply_markup=kb_main()
-            )
+        if ok:
+            bot_send(message.chat.id,
+                     f"مرحباً {name}! ✅\n\n🔗 <b>الحساب التجاري مرتبط وشغال.</b>\n\nاختر ما تريد:",
+                     kb_main())
         else:
-            # الربط انتهى — امسحه
             del data["connections"][uid]
             save_data(data)
-            bot.send_message(
-                message.chat.id,
-                f"مرحباً {name}! ⚠️\n\n"
-                "<b>الربط بالحساب التجاري انقطع.</b>\n\n"
-                "لإعادة الربط:\n"
-                "١. إعدادات تيليجرام ← بيزنس ← روبوتات الدردشة\n"
-                "٢. احذف البوت وأضفه من جديد\n"
-                "٣. امنحه كل الصلاحيات\n\n"
-                "ستصلك رسالة تأكيد بعد الربط. ✅",
-                parse_mode="HTML"
-            )
+            bot_send(message.chat.id,
+                     f"مرحباً {name}! ⚠️\n\n<b>الربط انقطع.</b>\n\n"
+                     "لإعادة الربط:\n"
+                     "١. إعدادات تيليجرام ← بيزنس ← روبوتات الدردشة\n"
+                     "٢. احذف البوت وأضفه من جديد\n"
+                     "٣. امنحه كل الصلاحيات\n\nستصلك رسالة تأكيد. ✅")
     else:
-        bot.send_message(
-            message.chat.id,
-            f"مرحباً {name}! 👋\n\n"
-            "⚠️ <b>البوت غير مرتبط بعد.</b>\n\n"
-            "لبدء الاستخدام:\n"
-            "١. إعدادات تيليجرام ← بيزنس ← روبوتات الدردشة\n"
-            "٢. ابحث عن البوت وقم بربطه\n"
-            "٣. امنحه كل الصلاحيات\n\n"
-            "ستصلك رسالة تأكيد بعد الربط. ✅",
-            parse_mode="HTML"
-        )
-
+        bot_send(message.chat.id,
+                 f"مرحباً {name}! 👋\n\n⚠️ <b>البوت غير مرتبط بعد.</b>\n\n"
+                 "لبدء الاستخدام:\n"
+                 "١. إعدادات تيليجرام ← بيزنس ← روبوتات الدردشة\n"
+                 "٢. ابحث عن البوت وقم بربطه\n"
+                 "٣. امنحه كل الصلاحيات\n\nستصلك رسالة تأكيد. ✅")
 
 # ==========================================
-# هاندلر ربط/فك البيزنس
+# هاندلر ربط البيزنس
 # ==========================================
 
 @bot.business_connection_handler()
 def handle_bc(bc):
-    uid = str(bc.user.id)
+    uid  = str(bc.user.id)
     data = load_data()
     if bc.is_enabled:
         data["connections"][uid] = bc.id
         save_data(data)
-        try:
-            bot.send_message(int(uid),
-                             "🎉 <b>تم الربط بنجاح!</b>\n\nيمكنك الآن استخدام الأوامر والاختصارات:",
-                             parse_mode="HTML", reply_markup=kb_main())
-        except Exception:
-            pass
+        bot_send(int(uid),
+                 "🎉 <b>تم الربط بنجاح!</b>\n\nيمكنك الآن استخدام الأوامر والاختصارات:",
+                 kb_main())
     else:
         data["connections"].pop(uid, None)
         save_data(data)
-        try:
-            bot.send_message(int(uid), "⚠️ <b>تم إلغاء الربط.</b>", parse_mode="HTML")
-        except Exception:
-            pass
-
+        bot_send(int(uid), "⚠️ <b>تم إلغاء الربط.</b>")
 
 # ==========================================
 # هاندلر الأزرار
@@ -276,29 +371,27 @@ def handle_cb(call):
         return
 
     data = load_data()
-    conn_id = get_conn_id(data, uid)
     bot.answer_callback_query(call.id)
 
     def edit(text, markup=None):
         try:
             bot.edit_message_text(text, cid, mid, parse_mode="HTML", reply_markup=markup)
         except Exception:
-            bot.send_message(cid, text, parse_mode="HTML", reply_markup=markup)
+            bot_send(cid, text, markup)
 
     def send(text, markup=None):
-        bot.send_message(cid, text, parse_mode="HTML", reply_markup=markup)
+        bot_send(cid, text, markup)
 
-    # ── رجوع للرئيسية ──
     if call.data == "menu_main":
         edit("🏠 <b>القائمة الرئيسية:</b>", kb_main())
 
-    # ── فحص الربط ──
     elif call.data == "check_connection":
+        conn_id = get_conn_id(data, uid)
         if not conn_id:
             send("⚠️ <b>لا يوجد ربط محفوظ.</b>", kb_main())
             return
         wait = send("🔄 جاري التحقق...")
-        ok = api_check_connection(conn_id)
+        ok   = api_check_connection(conn_id)
         try:
             bot.delete_message(cid, wait.message_id)
         except Exception:
@@ -310,86 +403,74 @@ def handle_cb(call):
             save_data(data)
             send("❌ <b>الربط انقطع، تم المسح.</b>\nأعد الربط من إعدادات تيليجرام.")
 
-    # ── قسم الأوامر ──
     elif call.data == "menu_commands":
         cmds = get_user_commands(data, uid)
-        text = (
+        edit(
             "⚙️ <b>الأوامر الحالية:</b>\n\n"
             f"🗑️ حذف:          <code>{escape_html(cmds['delete'])}</code>\n"
             f"📌 تثبيت:        <code>{escape_html(cmds['pin'])}</code>\n"
             f"🔓 إلغاء تثبيت: <code>{escape_html(cmds['unpin'])}</code>\n"
             f"🆔 آيدي:         <code>{escape_html(cmds['id'])}</code>\n"
             f"❓ مساعدة:       <code>{escape_html(cmds['help'])}</code>\n\n"
-            "اختر الأمر الذي تريد تغييره:"
+            "اختر الأمر الذي تريد تغييره:",
+            kb_commands()
         )
-        edit(text, kb_commands())
 
-    # ── عرض الأوامر ──
     elif call.data == "show_commands":
         cmds = get_user_commands(data, uid)
-        text = (
+        send(
             "📋 <b>الأوامر في شات البيزنس (رد على رسالة):</b>\n\n"
             f"🗑️ <code>{escape_html(cmds['delete'])}</code> — حذف الرسالة\n"
             f"📌 <code>{escape_html(cmds['pin'])}</code> — تثبيت الرسالة\n"
             f"🔓 <code>{escape_html(cmds['unpin'])}</code> — إلغاء التثبيت\n"
             f"🆔 <code>{escape_html(cmds['id'])}</code> — عرض الآيدي\n"
             f"❓ <code>{escape_html(cmds['help'])}</code> — قائمة المساعدة\n\n"
-            "💡 <i>اكتب الأمر رداً على أي رسالة في شات البيزنس.</i>"
+            "💡 <i>اكتب الأمر رداً على أي رسالة في شات البيزنس.</i>",
+            kb_main()
         )
-        send(text, kb_main())
 
-    # ── تغيير الأوامر ──
     elif call.data.startswith("set_cmd_"):
-        key = call.data.replace("set_cmd_", "")
+        key   = call.data.replace("set_cmd_", "")
         label = {"delete": "الحذف", "pin": "التثبيت", "unpin": "إلغاء التثبيت",
                  "id": "الآيدي", "help": "المساعدة"}.get(key, key)
         user_states[uid] = f"CMD_{key}"
         send(f"✏️ <b>أرسل الكلمة الجديدة لأمر {label}:</b>")
 
-    # ── قسم الاختصارات ──
     elif call.data == "menu_shortcuts":
         count = len(data.get("shortcuts", {}).get(uid, {}))
-        text = (
-            f"⚡ <b>اختصارات النصوص:</b>\n\n"
-            f"لديك <b>{count}</b> اختصار.\n\n"
-            "اكتب رمز الاختصار في شات البيزنس\n"
-            "وسيبدّله البوت بالنص الكامل تلقائياً."
+        edit(
+            f"⚡ <b>اختصارات النصوص:</b>\n\nلديك <b>{count}</b> اختصار.\n\n"
+            "اكتب رمز الاختصار في شات البيزنس وسيبدّله البوت بالنص الكامل تلقائياً.",
+            kb_shortcuts()
         )
-        edit(text, kb_shortcuts())
 
-    # ── إضافة اختصار ──
     elif call.data == "add_shortcut":
         user_states[uid] = "SC_TRIGGER"
         send("⌨️ <b>أرسل رمز الاختصار:</b>\n\nمثال: <code>.</code> أو <code>سلام</code>")
 
-    # ── عرض الاختصارات ──
     elif call.data == "list_shortcuts" or call.data.startswith("delsh_"):
         if call.data.startswith("delsh_"):
             trigger = call.data[6:]
             if uid in data.get("shortcuts", {}) and trigger in data["shortcuts"][uid]:
                 del data["shortcuts"][uid][trigger]
                 save_data(data)
-
         shortcuts = data.get("shortcuts", {}).get(uid, {})
         if not shortcuts:
             send("📋 <b>لا توجد اختصارات.</b>", kb_shortcuts())
             return
-
         lines = ["📋 <b>الاختصارات المحفوظة:</b>\n"]
         for t, exp in shortcuts.items():
             preview = exp[:35] + "..." if len(exp) > 35 else exp
             lines.append(f"• <code>{escape_html(t)}</code> ← {escape_html(preview)}")
         send("\n".join(lines), kb_shortcuts_list(shortcuts))
 
-    # ── مسح الاختصارات ──
     elif call.data == "clear_shortcuts":
         data.setdefault("shortcuts", {})[uid] = {}
         save_data(data)
         send("✅ <b>تم مسح جميع الاختصارات.</b>", kb_shortcuts())
 
-
 # ==========================================
-# هاندلر النصوص (حالات الإدخال من البوت مش البيزنس)
+# هاندلر النصوص (إدخال الأوامر والاختصارات)
 # ==========================================
 
 @bot.message_handler(
@@ -399,70 +480,105 @@ def handle_cb(call):
                    and user_states.get(str(m.from_user.id)) is not None
 )
 def handle_input(message):
-    uid = str(message.from_user.id)
+    uid   = str(message.from_user.id)
     state = user_states.pop(uid, None)
-    text = message.text.strip()
-    data = load_data()
+    text  = message.text.strip()
+    data  = load_data()
 
-    # تغيير أمر
     if state and state.startswith("CMD_"):
         key = state[4:]
         data.setdefault("custom_commands", {}).setdefault(uid, {})[key] = text
         save_data(data)
-        bot.send_message(message.chat.id,
-                         f"✅ <b>تم تغيير الأمر إلى:</b> <code>{escape_html(text)}</code>",
-                         parse_mode="HTML", reply_markup=kb_main())
+        bot_send(message.chat.id,
+                 f"✅ <b>تم تغيير الأمر إلى:</b> <code>{escape_html(text)}</code>",
+                 kb_main())
 
-    # إضافة اختصار - الرمز
     elif state == "SC_TRIGGER":
         user_temp_trigger[uid] = text
-        user_states[uid] = "SC_TEXT"
-        bot.send_message(message.chat.id,
-                         f"📝 <b>الرمز: <code>{escape_html(text)}</code></b>\n\n"
-                         "الآن أرسل النص الكامل الذي يظهر بدله:",
-                         parse_mode="HTML")
+        user_states[uid]       = "SC_TEXT"
+        bot_send(message.chat.id,
+                 f"📝 <b>الرمز: <code>{escape_html(text)}</code></b>\n\nأرسل النص الكامل الذي يظهر بدله:")
 
-    # إضافة اختصار - النص الكامل
     elif state == "SC_TEXT":
         trigger = user_temp_trigger.pop(uid, None)
         if not trigger:
-            bot.send_message(message.chat.id, "⚠️ حدث خطأ، ابدأ من جديد.", reply_markup=kb_main())
+            bot_send(message.chat.id, "⚠️ حدث خطأ، ابدأ من جديد.", kb_main())
             return
         data.setdefault("shortcuts", {}).setdefault(uid, {})[trigger] = text
         save_data(data)
-        bot.send_message(message.chat.id,
-                         f"✅ <b>تم حفظ الاختصار!</b>\n\n"
-                         f"الرمز: <code>{escape_html(trigger)}</code>\n"
-                         f"النص: {escape_html(text)}",
-                         parse_mode="HTML", reply_markup=kb_shortcuts())
-
+        bot_send(message.chat.id,
+                 f"✅ <b>تم حفظ الاختصار!</b>\n\nالرمز: <code>{escape_html(trigger)}</code>\nالنص: {escape_html(text)}",
+                 kb_shortcuts())
 
 # ==========================================
-# هاندلر رسائل البيزنس (تنفيذ الأوامر والاختصارات)
+# استخراج ميديا من رسالة
 # ==========================================
 
-@bot.business_message_handler(content_types=["text"])
-def handle_biz(message):
-    if not message.text:
-        return
+def extract_media(message):
+    """يرجع (media_type, file_id) أو (None, None)"""
+    if message.photo:
+        return "photo", message.photo[-1].file_id
+    if message.video:
+        return "video", message.video.file_id
+    if message.document:
+        return "document", message.document.file_id
+    if message.voice:
+        return "voice", message.voice.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
+    if message.sticker:
+        return "sticker", message.sticker.file_id
+    if message.animation:
+        return "animation", message.animation.file_id
+    if message.video_note:
+        return "video_note", message.video_note.file_id
+    return None, None
 
-    data = load_data()
+# ==========================================
+# هاندلر رسائل البيزنس الواردة — حفظ في الكاش
+# ==========================================
+
+@bot.business_message_handler(content_types=[
+    "text","photo","video","document","voice","audio",
+    "sticker","animation","video_note","contact","location"
+])
+def handle_biz_incoming(message):
+    data      = load_data()
     owner_uid = None
-    conn_id = None
+    conn_id   = None
     for uid, cid in data["connections"].items():
         if cid == message.business_connection_id:
             owner_uid = uid
-            conn_id = cid
+            conn_id   = cid
             break
-
     if not owner_uid:
         return
 
     is_out = str(message.from_user.id) == owner_uid
-    if not is_out:
-        return  # نتجاهل الرسائل الواردة من العملاء
+    nm, sid = sender_display(message)
 
-    raw = message.text.strip()
+    mtype, fid = extract_media(message)
+    text       = message.text    or ""
+    caption    = message.caption or ""
+
+    # احفظ الرسالة في الكاش
+    cache_msg(
+        owner_uid  = owner_uid,
+        chat_id    = message.chat.id,
+        msg_id     = message.message_id,
+        text       = text,
+        caption    = caption,
+        media_type = mtype,
+        file_id    = fid,
+        sender_name= nm,
+        sender_id  = sid
+    )
+
+    # لو مش صادرة، مفيش أوامر نفذها
+    if not is_out:
+        return
+
+    raw = text.strip()
     low = raw.lower()
 
     # ── اختصارات النصوص ──
@@ -471,31 +587,31 @@ def handle_biz(message):
         api_edit(conn_id, message.chat.id, message.message_id, shortcuts[raw])
         return
 
-    # ── أوامر (مع رد) ──
-    cmds = get_user_commands(data, owner_uid)
+    # ── أوامر ──
+    cmds  = get_user_commands(data, owner_uid)
     reply = message.reply_to_message
 
     if reply:
-        target_mid = reply.message_id
+        tmid  = reply.message_id
         tchat = message.chat.id
 
         if low == cmds["delete"].lower():
-            api_delete_msgs(conn_id, [target_mid, message.message_id])
+            api_delete_msgs(conn_id, [tmid, message.message_id])
 
         elif low == cmds["pin"].lower():
-            api_pin(conn_id, tchat, target_mid)
+            api_pin(conn_id, tchat, tmid)
             api_delete_msgs(conn_id, [message.message_id])
 
         elif low == cmds["unpin"].lower():
-            api_unpin(conn_id, tchat, target_mid)
+            api_unpin(conn_id, tchat, tmid)
             api_delete_msgs(conn_id, [message.message_id])
 
         elif low == cmds["id"].lower():
-            u = reply.from_user
-            nm = ((u.first_name or "") + " " + (u.last_name or "")).strip()
-            un = f"@{u.username}" if u.username else "لا يوجد"
+            u  = reply.from_user
+            nm2 = ((u.first_name or "") + " " + (u.last_name or "")).strip()
+            un  = f"@{u.username}" if u.username else "لا يوجد"
             api_edit(conn_id, tchat, message.message_id,
-                     f"🆔 <b>معلومات:</b>\n👤 {escape_html(nm)}\n🔗 {escape_html(un)}\n🪪 <code>{u.id}</code>")
+                     f"🆔 <b>معلومات:</b>\n👤 {escape_html(nm2)}\n🔗 {escape_html(un)}\n🪪 <code>{u.id}</code>")
 
         elif low == cmds["help"].lower():
             api_edit(conn_id, tchat, message.message_id,
@@ -505,15 +621,13 @@ def handle_biz(message):
                      f"🔓 <code>{escape_html(cmds['unpin'])}</code> إلغاء\n"
                      f"🆔 <code>{escape_html(cmds['id'])}</code> آيدي\n"
                      f"❓ <code>{escape_html(cmds['help'])}</code> مساعدة")
-
     else:
-        # ── أوامر بدون رد ──
         if low == cmds["id"].lower():
-            u = message.from_user
-            nm = ((u.first_name or "") + " " + (u.last_name or "")).strip()
-            un = f"@{u.username}" if u.username else "لا يوجد"
+            u   = message.from_user
+            nm2 = ((u.first_name or "") + " " + (u.last_name or "")).strip()
+            un  = f"@{u.username}" if u.username else "لا يوجد"
             api_edit(conn_id, message.chat.id, message.message_id,
-                     f"🆔 <b>معلوماتك:</b>\n👤 {escape_html(nm)}\n🔗 {escape_html(un)}\n🪪 <code>{owner_uid}</code>")
+                     f"🆔 <b>معلوماتك:</b>\n👤 {escape_html(nm2)}\n🔗 {escape_html(un)}\n🪪 <code>{owner_uid}</code>")
 
         elif low == cmds["help"].lower():
             api_edit(conn_id, message.chat.id, message.message_id,
@@ -524,9 +638,169 @@ def handle_biz(message):
                      f"🆔 <code>{escape_html(cmds['id'])}</code> آيدي\n"
                      f"❓ <code>{escape_html(cmds['help'])}</code> مساعدة")
 
+# ==========================================
+# إشعار التعديل
+# ==========================================
+
+@bot.edited_business_message_handler(content_types=[
+    "text","photo","video","document","voice","audio",
+    "sticker","animation","video_note"
+])
+def handle_biz_edit(message):
+    data      = load_data()
+    owner_uid = None
+    for uid, cid in data["connections"].items():
+        if cid == message.business_connection_id:
+            owner_uid = uid
+            break
+    if not owner_uid:
+        return
+
+    is_out   = str(message.from_user.id) == owner_uid
+    nm, _    = sender_display(message)
+    old_entry = get_cached_msg(owner_uid, message.chat.id, message.message_id)
+
+    old_text = ""
+    if old_entry:
+        old_text = old_entry.get("text") or old_entry.get("caption") or ""
+
+    new_text    = message.text or message.caption or ""
+    mtype, fid  = extract_media(message)
+
+    # حدّث الكاش
+    update_cached_text(owner_uid, message.chat.id, message.message_id,
+                       message.text or "", message.caption or "")
+
+    direction = "📤 صادرة" if is_out else f"📥 من: <b>{escape_html(nm)}</b>"
+    notif = (
+        f"✏️ <b>رسالة معدّلة</b>\n"
+        f"{direction}\n\n"
+        f"<b>قبل:</b> {escape_html(old_text) or '—'}\n"
+        f"<b>بعد:</b> {escape_html(new_text) or '—'}"
+    )
+    bot_send(int(owner_uid), notif)
 
 # ==========================================
-# Health Server (مطلوب عشان Render يشتغل)
+# إشعار الحذف
+# ==========================================
+
+@bot.deleted_business_messages_handler()
+def handle_biz_delete(deleted):
+    data      = load_data()
+    owner_uid = None
+    for uid, cid in data["connections"].items():
+        if cid == deleted.business_connection_id:
+            owner_uid = uid
+            break
+    if not owner_uid:
+        return
+
+    chat    = deleted.chat
+    cname   = ((chat.first_name or "") + " " + (chat.last_name or "")).strip() or "العميل"
+
+    for msg_id in deleted.message_ids:
+        entry = get_cached_msg(owner_uid, chat.id, msg_id)
+        delete_cached_msg(owner_uid, chat.id, msg_id)
+
+        if entry:
+            sender  = entry.get("sender_name") or "غير معروف"
+            content = entry.get("text") or entry.get("caption") or ""
+            mtype   = entry.get("media_type")
+            fid     = entry.get("file_id")
+            date    = entry.get("date", "")
+
+            notif = (
+                f"🗑️ <b>رسالة محذوفة</b>\n"
+                f"👤 من: <b>{escape_html(sender)}</b>\n"
+                f"💬 الشات: <b>{escape_html(cname)}</b>\n"
+                f"📅 أُرسلت: {date}\n\n"
+            )
+            if content:
+                notif += f"📝 <b>المحتوى:</b>\n{escape_html(content[:800])}"
+
+            bot_send(int(owner_uid), notif)
+
+            # لو فيه ميديا، ابعتها
+            if mtype and fid:
+                bot_send_media(int(owner_uid), entry)
+        else:
+            # مش موجودة في الكاش
+            bot_send(int(owner_uid),
+                     f"🗑️ <b>رسالة محذوفة (غير مؤرشفة)</b>\n"
+                     f"💬 الشات: <b>{escape_html(cname)}</b>\n"
+                     f"🔢 msg_id: <code>{msg_id}</code>")
+
+# ==========================================
+# التنظيف اليومي — كل يوم الساعة 00:00
+# ==========================================
+
+def daily_cleanup():
+    """كل يوم يبعت الكاش للمستخدم ثم يمسحه"""
+    while True:
+        now  = datetime.datetime.now()
+        # وقت الـ run التالي: منتصف الليل
+        next_run = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        sleep_secs = (next_run - now).total_seconds()
+        time.sleep(sleep_secs)
+
+        cache = load_cache()
+        if not cache:
+            continue
+
+        data = load_data()
+
+        for owner_uid, msgs in list(cache.items()):
+            if not msgs:
+                continue
+
+            try:
+                bot_send(int(owner_uid),
+                         f"📦 <b>ملخص يومي — {len(msgs)} رسالة محفوظة</b>\n"
+                         f"📅 {datetime.datetime.now().strftime('%Y-%m-%d')}\n\n"
+                         "فيما يلي جميع الرسائل المؤرشفة:")
+            except Exception:
+                pass
+
+            count = 0
+            for key, entry in msgs.items():
+                try:
+                    sender  = entry.get("sender_name") or "غير معروف"
+                    content = entry.get("text") or entry.get("caption") or ""
+                    mtype   = entry.get("media_type")
+                    fid     = entry.get("file_id")
+                    date    = entry.get("date", "")
+
+                    line = (
+                        f"📩 <b>رسالة #{count+1}</b>\n"
+                        f"👤 {escape_html(sender)}\n"
+                        f"📅 {date}\n"
+                    )
+                    if content:
+                        line += f"📝 {escape_html(content[:400])}"
+
+                    bot_send(int(owner_uid), line)
+
+                    if mtype and fid:
+                        bot_send_media(int(owner_uid), entry)
+
+                    count += 1
+                    if count % 20 == 0:
+                        time.sleep(1)  # تجنب flood
+                except Exception as e:
+                    logger.warning(f"daily_cleanup send: {e}")
+
+            try:
+                bot_send(int(owner_uid), "✅ <b>انتهى الملخص اليومي. تم مسح الأرشيف.</b>")
+            except Exception:
+                pass
+
+        # امسح الكاش بعد الإرسال
+        save_cache({})
+        logger.warning("Daily cleanup done.")
+
+# ==========================================
+# Health Server
 # ==========================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -535,21 +809,23 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, *args):
-        pass  # متطبعش logs الـ HTTP
+        pass
 
 def run_health_server():
-    port = int(os.environ.get("PORT", 10000))
+    port   = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
 # ==========================================
-# تشغيل البوت
+# تشغيل
 # ==========================================
 
 if __name__ == "__main__":
-    # شغّل الـ health server في thread منفصل
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
+    # Health server
+    threading.Thread(target=run_health_server, daemon=True).start()
+
+    # التنظيف اليومي
+    threading.Thread(target=daily_cleanup, daemon=True).start()
 
     try:
         bot.remove_webhook()
@@ -560,5 +836,9 @@ if __name__ == "__main__":
         timeout=30,
         long_polling_timeout=20,
         skip_pending=True,
-        allowed_updates=["message", "callback_query", "business_connection", "business_message"]
+        allowed_updates=[
+            "message", "callback_query",
+            "business_connection", "business_message",
+            "edited_business_message", "deleted_business_messages"
+        ]
     )
