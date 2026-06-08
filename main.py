@@ -11,8 +11,8 @@ from PIL import Image
 # ==========================================
 # الإعدادات — عدّلها حسب بياناتك
 # ==========================================
-TOKEN = "ضع_توكن_البوت_هنا"
-OWNER_ID = "ضع_آيدي_الأونر_هنا"
+TOKEN = "8841147509:AAGGm0ydQptJCyQ19fOqjl4V2O14bijKRU8"
+OWNER_ID = "7115401970"
 
 DATA_DIR = "./data"
 os.makedirs(DATA_DIR, exist_ok=True)
