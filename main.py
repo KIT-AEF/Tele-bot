@@ -9,7 +9,7 @@ from telebot import types
 # ==========================================
 # الإعدادات
 # ==========================================
-TOKEN = "8841147509:AAGGm0ydQptJCyQ19fOqjl4V2O14bijKRU8"
+TOKEN = "8841147509:AAGQJu6MoRQdkAD-wphy7Xkzn5xa7X6XMRg"
 OWNER_ID = "7115401970"
 
 DATA_DIR = "./data"
